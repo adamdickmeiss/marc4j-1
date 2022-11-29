@@ -42,6 +42,7 @@ import java.io.InputStreamReader;
 import java.io.UnsupportedEncodingException;
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -435,6 +436,18 @@ public class MarcPermissiveStreamReader implements MarcReader, ConverterErrorHan
         return recordBuf;
     }
 
+    static class DirectoryEntry implements Comparator {
+        String tag;
+        int length;
+        int offset;
+
+        public int compare(Object o1, Object o2) {
+            DirectoryEntry d1 = (DirectoryEntry) o1;
+            DirectoryEntry d2 = (DirectoryEntry) o2;
+            return d1.tag.compareTo(d2.tag);
+        }
+    }
+
     private void parseRecord(final Record record, byte[] byteArray, byte[] recordBuf,
             final int recordLength) {
         Leader ldr;
@@ -710,41 +723,37 @@ public class MarcPermissiveStreamReader implements MarcReader, ConverterErrorHan
 
         int size = directoryLength / 12;
 
-        final ArrayList<String> tags = new ArrayList<String>(size);
-        final ArrayList<Integer> lengths = new ArrayList<Integer>(size);
-        final ArrayList<Integer> offsets = new ArrayList<Integer>(size);
-        final HashMap<Integer, Integer> offsetsMap = new HashMap<Integer, Integer>();
-        boolean unsortedOffsets = false;
+        final ArrayList<DirectoryEntry> dir = new ArrayList<>(size);
+        boolean unsortedTags = false;
         int offsetToFT = 0;
 
         if (directoryLength % 12 == 0 && recordBuf[directoryLength] == Constants.FT) {
             boolean doneWithDirectory = false;
-            int totalOffset = 0;
             int offset = 0;
+            String prevTag = "";
             for (int i = 0; !doneWithDirectory; i++) {
+                DirectoryEntry entry = new DirectoryEntry();
                 final int increment = 12;
                 final int prevOffset = offset;
                 final String dirEntry = new String(recordBuf, offsetToFT, 14);
-                final String tag = dirEntry.substring(0, 3);
-                final int length = Integer.parseInt(dirEntry.substring(3, 7));
+                entry.tag = dirEntry.substring(0, 3);
+                entry.length = Integer.parseInt(dirEntry.substring(3, 7));
                 offset = Integer.parseInt(dirEntry.substring(7, 12));
-                tags.add(tag);
-                lengths.add(length);
                 if (offset >= 99999) {
-                    offset = prevOffset + length;
+                    offset = prevOffset + entry.length;
                 }
-                offsets.add(offset);
+                entry.offset = offset;
+                dir.add(entry);
                 offsetToFT += increment;
                 if (recordBuf[offsetToFT] == Constants.FT) {
                     doneWithDirectory = true;
                 }
-                offsetsMap.put(offset, i);
-                if (offset != totalOffset && totalOffset < 99999) {
-                    unsortedOffsets = true;
+                if (entry.tag.compareTo(prevTag) < 0) {
+                    unsortedTags = true;
                 }
-                totalOffset += length;
+                prevTag = entry.tag;
             }
-            size = tags.size();
+            size = dir.size();
         } else // if (directoryLength % 12 != 0 || recordBuf[directoryLength] !=
                // Constants.FT)
         {
@@ -809,14 +818,15 @@ public class MarcPermissiveStreamReader implements MarcReader, ConverterErrorHan
                     } catch (final NumberFormatException nfe) {
                     }
                 }
-                tags.add(tag);
-                lengths.add(length);
-                offsets.add(totalOffset);
                 offsetToFT += increment;
                 if (recordBuf[offsetToFT] == Constants.FT) {
                     doneWithDirectory = true;
                 }
-                offsetsMap.put(offset, i);
+                DirectoryEntry entry = new DirectoryEntry();
+                entry.length = length;
+                entry.tag = tag;
+                entry.offset = totalOffset;
+                dir.add(entry);
                 if (totalOffset < 99999 && offset != totalOffset) {
                     record.addError("n/a", "n/a", MarcError.FATAL,
                             "Offsets to fields are out of order AND the directory is messed up. Unable to continue.");
@@ -825,15 +835,19 @@ public class MarcPermissiveStreamReader implements MarcReader, ConverterErrorHan
                 }
                 totalOffset += length;
             }
-            size = tags.size();
+            size = dir.size();
         }
         if (directoryLength != offsetToFT) {
             record.addError("n/a", "n/a", MarcError.MINOR_ERROR,
                     "Specified directory length not equal to actual directory length.");
         }
 
-        if (unsortedOffsets) {
-            Collections.sort(offsets);
+        if (unsortedTags) {
+            Collections.sort(dir, new Comparator<DirectoryEntry>() {
+                public int compare(DirectoryEntry d1, DirectoryEntry d2) {
+                    return d1.tag.compareTo(d2.tag);
+                }
+            });
         }
 
         try {
@@ -844,22 +858,21 @@ public class MarcPermissiveStreamReader implements MarcReader, ConverterErrorHan
             int numBadLengths = 0;
 
             int totalLength = 0;
-            int i = 0;
-            for (int s = 0; s < size; s++) {
-                i = unsortedOffsets ? offsetsMap.get(offsets.get(s)).intValue() : s;
+            for (int i = 0; i < size; i++) {
                 final int fieldLength = getFieldLength(inputrec);
-                if (fieldLength + 1 != lengths.get(i) && permissive) {
+                DirectoryEntry entry = dir.get(i);
+                if (fieldLength + 1 != entry.length && permissive) {
                     if (numBadLengths < 5 && totalLength + fieldLength < recordLength + 26) {
                         inputrec.mark(9999);
-                        byteArray = new byte[lengths.get(i)];
+                        byteArray = new byte[dir.get(i).length];
                         inputrec.readFully(byteArray);
                         inputrec.reset();
-                        if (fieldLength + 1 < lengths.get(i) && byteArray[lengths.get(i) - 1] == Constants.FT) {
+                        if (fieldLength + 1 < entry.length && byteArray[entry.length - 1] == Constants.FT) {
                             record.addError("n/a", "n/a", MarcError.MINOR_ERROR,
                                     "Field Terminator character found in the middle of a field.");
                         } else {
                             numBadLengths++;
-                            lengths.set(i, fieldLength + 1);
+                            entry.length = fieldLength + 1;
                             record.addError("n/a", "n/a", MarcError.MINOR_ERROR,
                                     "Field length found in record different from length stated in the directory.");
                             if (fieldLength + 1 > 9999) {
@@ -867,13 +880,12 @@ public class MarcPermissiveStreamReader implements MarcReader, ConverterErrorHan
                                         "Field length is greater than 9999, record cannot be represented as a binary Marc record.");
                             }
                         }
-
                     }
                 }
 
-                totalLength += lengths.get(i);
-                if (isControlField(tags.get(i))) {
-                    byteArray = new byte[lengths.get(i) - 1];
+                totalLength += entry.length;
+                if (isControlField(entry.tag)) {
+                    byteArray = new byte[entry.length - 1];
                     inputrec.readFully(byteArray);
 
                     if (inputrec.read() != Constants.FT) {
@@ -883,18 +895,18 @@ public class MarcPermissiveStreamReader implements MarcReader, ConverterErrorHan
                     }
 
                     final ControlField field = factory.newControlField();
-                    field.setTag(tags.get(i));
+                    field.setTag(entry.tag);
                     field.setData(getDataAsString(byteArray));
                     record.addVariableField(field);
 
                 } else {
-                    byteArray = new byte[lengths.get(i)];
+                    byteArray = new byte[entry.length];
                     inputrec.readFully(byteArray);
                     try {
-                        record.addVariableField(parseDataField(record, tags.get(i), byteArray));
+                        record.addVariableField(parseDataField(record, entry.tag, byteArray));
                     } catch (final IOException e) {
                         throw new MarcException(
-                                "error parsing data field for tag: " + tags.get(i) + " with data: " + new String(
+                                "error parsing data field for tag: " + entry.tag + " with data: " + new String(
                                         byteArray), e);
                     }
                 }
